@@ -1,0 +1,161 @@
+name: 📅 주간 깃허브 활동 보고서
+
+on:
+  schedule:
+    - cron: "0 0 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
+
+concurrency:
+  group: weekly-github-report
+  cancel-in-progress: false
+
+env:
+  ORG: tomo-project
+  REPOSITORIES: backend,frontend,workflow,infrastructure
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 🔐 깃허브 앱 인증 토큰 발급
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: tomo-project
+          repositories: |
+            backend
+            frontend
+            workflow
+            infrastructure
+
+      - name: 📊 주간 업무 리포트 생성 및 전송
+        uses: actions/github-script@v8
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEEKLY_REPORT_WEBHOOK }}
+        with:
+          github-token: ${{ steps.app.outputs.token }}
+          script: |
+            const repositories = process.env.REPOSITORIES.split(',');
+            const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
+            if (!webhookUrl) throw new Error('DISCORD_WEEKLY_REPORT_WEBHOOK Secret을 확인하세요.');
+            const ASSIGNEE_NAMES = {
+              'minzx23': '🐿️ 강민주',
+              'seul15': '🐣 이슬',
+              'WhiteBin-bin': '🐯 백현빈',
+              'sooloin': '🐧 조수빈',
+              'Anchovia': '🐉 전병훈',
+              'KJK1023': '🧙🏻‍♂️ 김재균',
+            };
+            const WORK_TYPE_LABELS = new Set([
+              'Chore', '⚙️ Chore',
+              'Feature', '✨ Feature',
+              'Bug', '🐛 Bug',
+              'DevOps', '🐳 DevOps',
+              'MVP', '👑 MVP',
+              'Docs', '📚 Docs',
+              'Security', '🔒 Security',
+              '2차 기능', '🔥 2차 기능',
+              'Refactor', '🛠 Refactor',
+              'Test', '🧪 Test',
+              'Style', '🧹 Style',
+              'Design', '🎨 Design',
+            ]);
+
+            const end = new Date();
+            const start = new Date(end);
+            start.setUTCDate(start.getUTCDate() - 7);
+            const isoDate = date => date.toISOString().slice(0, 10);
+            const since = isoDate(start);
+            const until = isoDate(end);
+            const issues = [];
+            const openIssues = [];
+
+            for (const repository of repositories) {
+              const recent = await github.paginate(github.rest.search.issuesAndPullRequests, {
+                q: `repo:${process.env.ORG}/${repository} is:issue updated:>=${since}`,
+                per_page: 100,
+              });
+              issues.push(...recent.map(issue => ({ ...issue, repository })));
+
+              const open = await github.paginate(github.rest.search.issuesAndPullRequests, {
+                q: `repo:${process.env.ORG}/${repository} is:issue is:open`,
+                per_page: 100,
+              });
+              openIssues.push(...open.map(issue => ({ ...issue, repository })));
+            }
+
+            const created = issues.filter(issue => issue.created_at >= start.toISOString());
+            const completed = issues.filter(issue => issue.closed_at && issue.closed_at >= start.toISOString());
+
+            const ranked = entries => [...entries.entries()].sort((a, b) => b[1] - a[1]);
+            const formatRanked = entries => entries.length
+              ? entries.slice(0, 10).map(([name, count]) => `• ${name}: ${count}건`).join('\n')
+              : '• 없음';
+            const formatIssues = list => list.length
+              ? list.slice(0, 10).map(issue => `• ${issue.title} (#${issue.number})`).join('\n')
+              : '• 없음';
+            const omitted = list => list.length > 10 ? `\n외 ${list.length - 10}건` : '';
+            const repositoryEmbed = (repository, title) => {
+              const repositoryIssues = issues.filter(issue => issue.repository === repository);
+              const repositoryCreated = created.filter(issue => issue.repository === repository);
+              const repositoryCompleted = completed.filter(issue => issue.repository === repository);
+              const repositoryAssignees = new Map();
+              const repositoryLabels = new Map();
+              for (const issue of repositoryIssues) {
+                for (const assignee of issue.assignees || []) {
+                  const name = ASSIGNEE_NAMES[assignee.login] || assignee.login;
+                  repositoryAssignees.set(name, (repositoryAssignees.get(name) || 0) + 1);
+                }
+                for (const label of issue.labels || []) {
+                  if (!WORK_TYPE_LABELS.has(label.name)) continue;
+                  repositoryLabels.set(label.name, (repositoryLabels.get(label.name) || 0) + 1);
+                }
+              }
+              return {
+                title,
+                color: 0x5865f2,
+                fields: [
+                  { name: '🏷️ 라벨별 이슈', value: formatRanked(ranked(repositoryLabels)), inline: true },
+                  { name: '👥 담당자별 작업량', value: formatRanked(ranked(repositoryAssignees)), inline: true },
+                  { name: '🆕 이번 주 생성 이슈', value: (formatIssues(repositoryCreated) + omitted(repositoryCreated)).slice(0, 1024), inline: false },
+                  { name: '✅ 이번 주 완료 이슈', value: (formatIssues(repositoryCompleted) + omitted(repositoryCompleted)).slice(0, 1024), inline: false },
+                ],
+              };
+            };
+
+            const summary = [
+              `**기간**: ${since} ~ ${until}`,
+              '',
+              `• 생성 이슈: ${created.length}건`,
+              `• 완료 이슈: ${completed.length}건`,
+              `• 현재 진행 중: ${openIssues.length}건`,
+            ].join('\n');
+
+            const response = await fetch(webhookUrl, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                username: '📊 주간 깃허브 리포트',
+                embeds: [
+                  {
+                    title: '📊 주간 업무 리포트',
+                  description: summary,
+                  color: 0x5865f2,
+                  footer: { text: '깃허브 프로젝트 · 백엔드 / 프론트엔드 / 워크플로우 / 인프라' },
+                  },
+                  repositoryEmbed('backend', '백엔드'),
+                  repositoryEmbed('frontend', '프론트엔드'),
+                  repositoryEmbed('workflow', '워크플로우'),
+                  repositoryEmbed('infrastructure', '인프라'),
+                ],
+              }),
+            });
+            if (!response.ok) throw new Error(`Discord ${response.status}: ${await response.text()}`);
+            console.log(`주간 리포트 전송 완료: 생성 ${created.length}건, 완료 ${completed.length}건`);
